@@ -50,7 +50,7 @@ div[data-testid="stMetric"] {
 
 DEX = "https://api.dexscreener.com"
 CG = "https://api.coingecko.com/api/v3"
-HEADERS = {"accept":"application/json","user-agent":"market-intelligence-pro/8.0"}
+HEADERS = {"accept":"application/json","user-agent":"market-intelligence-pro/9.0"}
 
 MAJOR_CRYPTO = {
     "BTC":"BTC-USD","ETH":"ETH-USD","SOL":"SOL-USD","XRP":"XRP-USD",
@@ -871,6 +871,10 @@ def combined_stock_conviction(technical, insider):
     return {"score": round(combined, 1), "label": label, "action": action}
 
 def render_insider_card(ticker, technical=None):
+    try:
+        alert_insider_asset(ticker,technical)
+    except Exception:
+        pass
     ins = insider_engine(ticker)
     combo = combined_stock_conviction(technical, ins) if technical else None
     icon = badge_for_score(ins["score"])
@@ -1187,6 +1191,10 @@ def render_insider_proxy_panel(bot):
 # ---------------------------- RENDERERS ----------------------------
 
 def render_dex_card(p,sources,mode="early"):
+    try:
+        alert_meme_asset(p,sources,mode)
+    except Exception:
+        pass
     base=p.get("baseToken") or {}
     quote=p.get("quoteToken") or {}
     m=dex_metrics(p,sources)
@@ -1297,6 +1305,10 @@ def render_dex_card(p,sources,mode="early"):
             st.link_button("Open on DEX Screener",p["url"],use_container_width=True)
 
 def render_technical_card(label,ticker,rd,kind,news_count=0,headlines=None):
+    try:
+        alert_technical_asset(label,ticker,rd,kind)
+    except Exception:
+        pass
     icon=badge_for_score(rd["score"])
     st.markdown(f"""
     <div class="card">
@@ -1363,12 +1375,197 @@ def render_technical_card(label,ticker,rd,kind,news_count=0,headlines=None):
             for h in headlines[:3]:
                 st.caption("• "+h)
 
+
+# ---------------------------- NOTIFICATION ENGINE ----------------------------
+
+def secret_value(section, key, default=""):
+    try:
+        if section in st.secrets and key in st.secrets[section]:
+            return str(st.secrets[section][key])
+    except Exception:
+        pass
+    return default
+
+def init_notification_state():
+    defaults = {
+        "notify_enabled": True,
+        "notify_telegram": True,
+        "notify_pushover": False,
+        "notify_early_meme": True,
+        "notify_attention": True,
+        "notify_crypto": True,
+        "notify_stocks": True,
+        "notify_insiders": True,
+        "notify_watchlist": True,
+        "notify_min_score": 80,
+        "notify_attention_score": 80,
+        "notify_insider_score": 82,
+        "notify_cooldown_minutes": 30,
+        "_alert_last_sent": {},
+    }
+    for k,v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+def telegram_ready():
+    return bool(secret_value("telegram","bot_token") and secret_value("telegram","chat_id"))
+
+def pushover_ready():
+    return bool(secret_value("pushover","api_token") and secret_value("pushover","user_key"))
+
+def send_telegram(title, message):
+    token=secret_value("telegram","bot_token")
+    chat_id=secret_value("telegram","chat_id")
+    if not token or not chat_id:
+        return False, "Telegram secrets missing."
+    try:
+        r=requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id":chat_id,"text":f"{title}\n\n{message}"},
+            timeout=12
+        )
+        r.raise_for_status()
+        payload=r.json()
+        if not payload.get("ok",False):
+            return False, str(payload)
+        return True, "Telegram sent."
+    except Exception as e:
+        return False, str(e)
+
+def send_pushover(title, message, priority=0):
+    token=secret_value("pushover","api_token")
+    user=secret_value("pushover","user_key")
+    if not token or not user:
+        return False, "Pushover secrets missing."
+    try:
+        r=requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={
+                "token":token,
+                "user":user,
+                "title":title[:250],
+                "message":message[:1024],
+                "priority":priority,
+            },
+            timeout=12
+        )
+        r.raise_for_status()
+        return True, "Pushover sent."
+    except Exception as e:
+        return False, str(e)
+
+def _alert_due(key):
+    now=datetime.now(timezone.utc).timestamp()
+    last=st.session_state["_alert_last_sent"].get(key,0)
+    cooldown=float(st.session_state["notify_cooldown_minutes"])*60
+    return (now-last)>=cooldown
+
+def send_market_alert(key, title, message, priority=0):
+    if not st.session_state.get("notify_enabled",False):
+        return
+    if not _alert_due(key):
+        return
+
+    sent=False
+    if st.session_state.get("notify_telegram",False) and telegram_ready():
+        ok,_=send_telegram(title,message)
+        sent=sent or ok
+    if st.session_state.get("notify_pushover",False) and pushover_ready():
+        ok,_=send_pushover(title,message,priority)
+        sent=sent or ok
+
+    if sent:
+        st.session_state["_alert_last_sent"][key]=datetime.now(timezone.utc).timestamp()
+
+def alert_technical_asset(label, ticker, rd, kind, source="section"):
+    if not rd:
+        return
+    enabled = st.session_state.get("notify_crypto",True) if kind=="Crypto" else st.session_state.get("notify_stocks",True)
+    if not enabled:
+        return
+    threshold=float(st.session_state.get("notify_min_score",80))
+    if rd["score"] < threshold:
+        return
+
+    title=f"🚨 {kind} setup: {label}"
+    msg=(
+        f"{rd['action']} | {rd['direction']} | score {rd['score']}/100\n"
+        f"Price: {money(rd['price'])}\n"
+        f"Entry: {money(rd['entry_lo'])} – {money(rd['entry_hi'])}\n"
+        f"Stop: {money(rd['stop'])}\n"
+        f"TP1: {money(rd['tp1'])} | TP2: {money(rd['tp2'])} | TP3: {money(rd['tp3'])}\n"
+        f"Confidence: {rd['confidence']}"
+    )
+    send_market_alert(f"{source}:{kind}:{ticker}:{rd['action']}",title,msg,0)
+
+def alert_meme_asset(p, sources, mode):
+    m=dex_metrics(p,sources)
+    base=p.get("baseToken") or {}
+    sym=base.get("symbol") or "?"
+    name=base.get("name") or sym
+    chain=network_name(p.get("chainId"))
+    addr=base.get("address") or ""
+
+    if mode=="early":
+        if not st.session_state.get("notify_early_meme",True):
+            return
+        score,verdict,direction,confidence,good,risk=early_quality_score(m)
+        if score < float(st.session_state.get("notify_min_score",80)):
+            return
+        title=f"🌱 Early meme alert: {name} ({sym})"
+        msg=(
+            f"{verdict} | {direction} | {score}/100\n"
+            f"Age: {m['age']['label']} | {chain}\n"
+            f"Price: {money(m['price'])}\n"
+            f"Liquidity: {compact(m['liq'])} | 1h vol: {compact(m['vol1'])}\n"
+            f"5m buys/sells: {int(m['b5'])}/{int(m['s5'])}\n"
+            f"1h move: {m['pc1']:+.1f}%\n"
+            f"Contract: {addr}"
+        )
+        send_market_alert(f"meme-early:{chain}:{addr}:{verdict}",title,msg,1 if score>=90 else 0)
+    else:
+        if not st.session_state.get("notify_attention",True):
+            return
+        score,drivers,warnings=attention_score(m)
+        if score < float(st.session_state.get("notify_attention_score",80)):
+            return
+        title=f"🔥 Meme attention: {name} ({sym})"
+        msg=(
+            f"Attention score {score}/100\n"
+            f"Age: {m['age']['label']} | {chain}\n"
+            f"5m volume: {compact(m['vol5'])} | 1h volume: {compact(m['vol1'])}\n"
+            f"5m buys/sells: {int(m['b5'])}/{int(m['s5'])}\n"
+            f"Boost total: {int(m['meta']['boost_total'])}\n"
+            f"Contract: {addr}"
+        )
+        send_market_alert(f"meme-attn:{chain}:{addr}",title,msg,0)
+
+def alert_insider_asset(ticker, tech=None):
+    if not st.session_state.get("notify_insiders",True):
+        return
+    ins=insider_engine(ticker)
+    threshold=float(st.session_state.get("notify_insider_score",82))
+    if ins["score"] < threshold or ins["buy_count"] <= 0:
+        return
+    combo=combined_stock_conviction(tech,ins) if tech else None
+    title=f"🕵️ Insider buying: {ticker}"
+    msg=(
+        f"{ins['signal']} | insider score {ins['score']}/100\n"
+        f"Open-market buys: {ins['buy_count']} | value: {compact(ins['open_buy_value'])}\n"
+        f"Different insiders buying: {ins['cluster_buyers']}\n"
+        + (f"Combined conviction: {combo['score']}/100 | {combo['label']}\n" if combo else "")
+    )
+    send_market_alert(f"insider:{ticker}:{ins['signal']}",title,msg,1 if ins["score"]>=90 else 0)
+
+init_notification_state()
+
+
 # ---------------------------- MAIN UI ----------------------------
 
 st.markdown("""
 <div class="hero">
-  <div style="font-size:1.7rem;font-weight:900">🧠 Market Intelligence Pro v8</div>
-  <div class="muted">Early meme discovery • attention radar • crypto • stocks • insider/smart-money layer in every section • entries • hold/exit logic • risk controls</div>
+  <div style="font-size:1.7rem;font-weight:900">🧠 Market Intelligence Pro v9</div>
+  <div class="muted">Early meme discovery • attention radar • crypto • stocks • insider/smart-money layer • Telegram/Pushover alerts • entries • hold/exit logic • risk controls</div>
 </div>
 """,unsafe_allow_html=True)
 
@@ -1384,6 +1581,7 @@ tabs=st.tabs([
     "📈 Stocks",
     "🕵️ Public Insider Bot",
     "⭐ Watchlist",
+    "🔔 Notifications",
     "🛡️ Risk Calculator"
 ])
 
@@ -1563,8 +1761,118 @@ with tabs[5]:
         kind="Crypto" if t.endswith("-USD") else "Stock"
         render_technical_card(orig,t,rd,kind)
 
-# ---------------- TAB 6: RISK ----------------
+
+# ---------------- TAB 7: NOTIFICATIONS ----------------
 with tabs[6]:
+    st.subheader("🔔 Notifications")
+    st.caption("Send high-quality setup alerts to Telegram and/or Pushover on your iPhone.")
+
+    st.warning(
+        "In-app alerts run while the Streamlit app/server is active. Community Cloud can sleep, "
+        "so this alone is not guaranteed to be 24/7 background monitoring."
+    )
+
+    st.markdown("### Provider status")
+    c1,c2=st.columns(2)
+    with c1:
+        st.metric("Telegram", "READY" if telegram_ready() else "NOT CONFIGURED")
+    with c2:
+        st.metric("Pushover", "READY" if pushover_ready() else "NOT CONFIGURED")
+
+    st.markdown("### Alert switches")
+    st.session_state["notify_enabled"]=st.toggle(
+        "Master notifications",value=st.session_state["notify_enabled"]
+    )
+    c1,c2=st.columns(2)
+    with c1:
+        st.session_state["notify_telegram"]=st.toggle(
+            "Telegram alerts",value=st.session_state["notify_telegram"]
+        )
+    with c2:
+        st.session_state["notify_pushover"]=st.toggle(
+            "Pushover iPhone alerts",value=st.session_state["notify_pushover"]
+        )
+
+    c1,c2=st.columns(2)
+    with c1:
+        st.session_state["notify_early_meme"]=st.toggle(
+            "New meme quality alerts",value=st.session_state["notify_early_meme"]
+        )
+        st.session_state["notify_crypto"]=st.toggle(
+            "Crypto alerts",value=st.session_state["notify_crypto"]
+        )
+        st.session_state["notify_insiders"]=st.toggle(
+            "Public insider-buying alerts",value=st.session_state["notify_insiders"]
+        )
+    with c2:
+        st.session_state["notify_attention"]=st.toggle(
+            "Meme attention alerts",value=st.session_state["notify_attention"]
+        )
+        st.session_state["notify_stocks"]=st.toggle(
+            "Stock alerts",value=st.session_state["notify_stocks"]
+        )
+        st.session_state["notify_watchlist"]=st.toggle(
+            "Watchlist alerts",value=st.session_state["notify_watchlist"]
+        )
+
+    st.markdown("### Trigger strength")
+    st.session_state["notify_min_score"]=st.slider(
+        "Minimum setup score",60,95,int(st.session_state["notify_min_score"])
+    )
+    st.session_state["notify_attention_score"]=st.slider(
+        "Minimum meme attention score",60,95,int(st.session_state["notify_attention_score"])
+    )
+    st.session_state["notify_insider_score"]=st.slider(
+        "Minimum insider score",60,95,int(st.session_state["notify_insider_score"])
+    )
+    st.session_state["notify_cooldown_minutes"]=st.slider(
+        "Don't repeat the same alert for",5,240,int(st.session_state["notify_cooldown_minutes"]),5,
+        help="Cooldown is per signal/asset in the current running app session."
+    )
+
+    st.markdown("### Send a test")
+    c1,c2=st.columns(2)
+    with c1:
+        if st.button("Test Telegram",use_container_width=True):
+            ok,msg=send_telegram(
+                "✅ Market Intelligence Pro v9",
+                "Telegram notifications are connected correctly."
+            )
+            st.success(msg) if ok else st.error(msg)
+    with c2:
+        if st.button("Test Pushover",use_container_width=True):
+            ok,msg=send_pushover(
+                "Market Intelligence Pro v9",
+                "Pushover notifications are connected correctly."
+            )
+            st.success(msg) if ok else st.error(msg)
+
+    st.markdown("### Streamlit Secrets setup")
+    st.write(
+        "Put the credentials in Streamlit **Settings → Secrets**. Do not paste API tokens into "
+        "your public `app.py` file."
+    )
+    secrets_example = """[telegram]
+bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
+chat_id = "YOUR_TELEGRAM_CHAT_ID"
+
+[pushover]
+api_token = "YOUR_PUSHOVER_APP_TOKEN"
+user_key = "YOUR_PUSHOVER_USER_KEY"
+"""
+    st.code(secrets_example,language="toml")
+
+    with st.expander("How the alerts trigger"):
+        st.write(
+            "Early Meme alerts trigger when the Early Quality score crosses your threshold. "
+            "Attention alerts use the Attention score. Crypto and stocks use their technical setup score. "
+            "The Insider Bot only alerts on strong public insider-buying signals. A cooldown prevents the "
+            "same signal from being sent every refresh."
+        )
+
+
+# ---------------- TAB 6: RISK ----------------
+with tabs[7]:
     st.subheader("🛡️ Position Size & Risk Calculator")
     st.caption("The part that helps keep one bad trade from destroying the account.")
 
