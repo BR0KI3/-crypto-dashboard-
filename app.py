@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-import time
 import requests
 import numpy as np
 import pandas as pd
@@ -7,7 +6,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="Simple Market Scanner",
+    page_title="Simple Market Scanner v3.1",
     page_icon="📈",
     layout="centered",
     initial_sidebar_state="collapsed"
@@ -34,27 +33,39 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Curated CoinGecko IDs for common crypto symbols.
-# Add more here if needed.
+# Common crypto + meme coins. Unknown symbols can also be resolved through CoinGecko search.
 CRYPTO_MAP = {
+    # Major crypto
     "BTC": "bitcoin",
     "ETH": "ethereum",
     "SOL": "solana",
+    "XRP": "ripple",
+    "ADA": "cardano",
     "DOGE": "dogecoin",
-    "SHIB": "shiba-inu",
     "AVAX": "avalanche-2",
     "LINK": "chainlink",
     "LTC": "litecoin",
     "BCH": "bitcoin-cash",
     "UNI": "uniswap",
-    "XRP": "ripple",
-    "ADA": "cardano",
     "DOT": "polkadot",
+
+    # Meme coins
+    "SHIB": "shiba-inu",
     "PEPE": "pepe",
     "BONK": "bonk",
     "WIF": "dogwifcoin",
+    "FLOKI": "floki",
     "TRUMP": "official-trump",
+    "MOG": "mog-coin",
+    "POPCAT": "popcat",
+    "PNUT": "peanut-the-squirrel",
+    "PENGU": "pudgy-penguins",
+    "BRETT": "brett",
 }
+
+MAJOR_PRESET = "BTC,ETH,SOL,XRP,ADA,DOGE,AVAX,LINK"
+MEME_PRESET = "DOGE,SHIB,PEPE,BONK,WIF,FLOKI,TRUMP,MOG,POPCAT,PNUT,PENGU,BRETT"
+STOCK_PRESET = "AAPL,TSLA,NVDA,AMD,MSFT,AMZN"
 
 def age_text(dt):
     if not dt:
@@ -89,18 +100,28 @@ def simple_score(prices):
     rsi = float((100 - 100/(1+rs)).fillna(50).iloc[-1])
 
     score = 50
-    if ema9 > ema21: score += 12
-    else: score -= 8
-    if ema21 > ema50: score += 12
-    else: score -= 8
-    if s.iloc[-1] > ema9: score += 6
-    if 52 <= rsi <= 68: score += 12
-    elif rsi > 78: score -= 8
-    elif rsi < 38: score -= 5
+    if ema9 > ema21:
+        score += 12
+    else:
+        score -= 8
+    if ema21 > ema50:
+        score += 12
+    else:
+        score -= 8
+    if s.iloc[-1] > ema9:
+        score += 6
+    if 52 <= rsi <= 68:
+        score += 12
+    elif rsi > 78:
+        score -= 8
+    elif rsi < 38:
+        score -= 5
 
     ret5 = (s.iloc[-1] / s.iloc[-6] - 1) * 100 if len(s) > 6 else 0
-    if ret5 > 0: score += 6
-    if ret5 > 8: score -= 6
+    if ret5 > 0:
+        score += 6
+    if ret5 > 8:
+        score -= 6
 
     score = float(max(0, min(100, round(score, 1))))
     if score >= 72:
@@ -113,24 +134,51 @@ def simple_score(prices):
         action = "WAIT"
     return score, action
 
+def gecko_headers():
+    return {"accept": "application/json", "user-agent": "simple-market-scanner-v3.1"}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def resolve_coin_id(symbol):
+    symbol = symbol.upper().strip()
+    if symbol in CRYPTO_MAP:
+        return CRYPTO_MAP[symbol]
+
+    # Fallback: search CoinGecko for newer coins/meme coins not hard-coded above.
+    r = requests.get(
+        "https://api.coingecko.com/api/v3/search",
+        params={"query": symbol},
+        headers=gecko_headers(),
+        timeout=15
+    )
+    r.raise_for_status()
+    coins = r.json().get("coins", [])
+
+    # Prefer exact symbol match.
+    exact = [c for c in coins if (c.get("symbol") or "").upper() == symbol]
+    if exact:
+        # CoinGecko search results are generally ranked by relevance/market presence.
+        return exact[0]["id"]
+
+    if coins:
+        return coins[0]["id"]
+
+    raise ValueError(f"Could not find {symbol} on CoinGecko.")
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_crypto(symbol):
     symbol = symbol.upper().strip()
-    coin_id = CRYPTO_MAP.get(symbol)
-    if not coin_id:
-        raise ValueError(f"{symbol} is not in the crypto map yet.")
+    coin_id = resolve_coin_id(symbol)
 
     detail_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
     market_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    headers = {"accept": "application/json", "user-agent": "simple-market-scanner"}
 
-    d = requests.get(detail_url, headers=headers, timeout=15)
+    d = requests.get(detail_url, headers=gecko_headers(), timeout=15)
     d.raise_for_status()
     detail = d.json()
 
     m = requests.get(
         market_url,
-        headers=headers,
+        headers=gecko_headers(),
         params={"vs_currency": "usd", "days": "30", "interval": "hourly"},
         timeout=15
     )
@@ -143,7 +191,6 @@ def get_crypto(symbol):
     current = detail.get("market_data", {}).get("current_price", {}).get("usd")
     name = detail.get("name", symbol)
 
-    # Prefer a non-empty contract address. Native coins may not have one.
     platforms = detail.get("platforms") or {}
     contracts = [(network, addr) for network, addr in platforms.items() if addr]
     network = contracts[0][0] if contracts else None
@@ -157,18 +204,15 @@ def get_crypto(symbol):
         except Exception:
             pass
 
-    # If genesis date missing, approximate age from earliest returned historical point.
-    if launch_dt is None and market.get("prices"):
-        ts = market["prices"][0][0] / 1000
-        # This is only the beginning of our 30-day lookback, so don't label it as launch.
-        launch_label = "Launch date unavailable"
-        age = "Unknown"
-    else:
-        launch_label = genesis or "Unknown"
-        age = age_text(launch_dt)
+    age = age_text(launch_dt) if launch_dt else "Unknown"
+    launch_label = genesis or "Launch date unavailable"
+
+    # Identify whether it looks like a meme preset symbol.
+    meme_symbols = set(MEME_PRESET.split(","))
+    asset_label = "Meme Coin" if symbol in meme_symbols else "Crypto"
 
     return {
-        "type": "Crypto",
+        "type": asset_label,
         "name": name,
         "symbol": symbol,
         "price": current,
@@ -178,6 +222,7 @@ def get_crypto(symbol):
         "address": contract,
         "age": age,
         "since": launch_label,
+        "coingecko_id": coin_id,
     }
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -253,7 +298,7 @@ def show_card(a):
     c1.metric("How long it's been out", a["age"])
     c2.metric("First/launch date", a["since"])
 
-    if a["type"] == "Crypto":
+    if a["type"] in ("Crypto", "Meme Coin"):
         st.markdown("**Network / contract address**")
         if a["address"]:
             st.write(a["network"] or "Network")
@@ -266,18 +311,22 @@ def show_card(a):
         st.caption("Regular stocks do not have blockchain contract addresses.")
 
 st.title("📈 Simple Market Scanner")
-st.caption("Simple cards: price, signal, score, age, and address/identifier.")
+st.caption("Stocks, crypto, and meme coins in one simple scanner.")
 
-mode = st.segmented_control("Asset type", ["Crypto", "Stocks"], default="Crypto")
+mode = st.segmented_control(
+    "What do you want to scan?",
+    ["Crypto", "Meme Coins", "Stocks"],
+    default="Meme Coins"
+)
 
 if mode == "Crypto":
-    default = "BTC,ETH,SOL,DOGE,SHIB,PEPE,BONK,WIF"
-    symbols_text = st.text_input("Coins", value=default)
+    symbols_text = st.text_input("Crypto", value=MAJOR_PRESET)
+elif mode == "Meme Coins":
+    symbols_text = st.text_input("Meme coins", value=MEME_PRESET)
 else:
-    default = "AAPL,TSLA,NVDA,AMD,MSFT,AMZN"
-    symbols_text = st.text_input("Stocks", value=default)
+    symbols_text = st.text_input("Stocks", value=STOCK_PRESET)
 
-symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()][:12]
+symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()][:16]
 
 if st.button("🔄 Refresh", use_container_width=True):
     st.cache_data.clear()
@@ -289,9 +338,12 @@ errors = []
 with st.spinner("Loading market data..."):
     for s in symbols:
         try:
-            assets.append(get_crypto(s) if mode == "Crypto" else get_stock(s))
+            if mode == "Stocks":
+                assets.append(get_stock(s))
+            else:
+                assets.append(get_crypto(s))
         except Exception as e:
-            errors.append(str(e))
+            errors.append(f"{s}: {e}")
 
 assets.sort(key=lambda x: x["score"], reverse=True)
 
@@ -304,7 +356,7 @@ for a in assets:
     show_card(a)
 
 st.caption(
-    "Age for stocks uses the earliest daily trading history available from the data provider. "
-    "Crypto launch age uses the provider's genesis date when available. Contract addresses must "
-    "always be verified before trading because symbols can be copied by scam tokens."
+    "For stocks, age uses the earliest daily trading history available from the provider. "
+    "For crypto, launch age uses CoinGecko's genesis date when available. "
+    "Always verify a token contract address before trading because unrelated/scam tokens can copy names and symbols."
 )
