@@ -50,7 +50,7 @@ div[data-testid="stMetric"] {
 
 DEX = "https://api.dexscreener.com"
 CG = "https://api.coingecko.com/api/v3"
-HEADERS = {"accept":"application/json","user-agent":"market-intelligence-pro/9.0"}
+HEADERS = {"accept":"application/json","user-agent":"market-intelligence-pro/10.0"}
 
 MAJOR_CRYPTO = {
     "BTC":"BTC-USD","ETH":"ETH-USD","SOL":"SOL-USD","XRP":"XRP-USD",
@@ -1564,7 +1564,7 @@ init_notification_state()
 
 st.markdown("""
 <div class="hero">
-  <div style="font-size:1.7rem;font-weight:900">🧠 Market Intelligence Pro v9</div>
+  <div style="font-size:1.7rem;font-weight:900">🧠 Market Intelligence Pro v10</div>
   <div class="muted">Early meme discovery • attention radar • crypto • stocks • insider/smart-money layer • Telegram/Pushover alerts • entries • hold/exit logic • risk controls</div>
 </div>
 """,unsafe_allow_html=True)
@@ -1835,14 +1835,14 @@ with tabs[6]:
     with c1:
         if st.button("Test Telegram",use_container_width=True):
             ok,msg=send_telegram(
-                "✅ Market Intelligence Pro v9",
+                "✅ Market Intelligence Pro v10",
                 "Telegram notifications are connected correctly."
             )
             st.success(msg) if ok else st.error(msg)
     with c2:
         if st.button("Test Pushover",use_container_width=True):
             ok,msg=send_pushover(
-                "Market Intelligence Pro v9",
+                "Market Intelligence Pro v10",
                 "Pushover notifications are connected correctly."
             )
             st.success(msg) if ok else st.error(msg)
