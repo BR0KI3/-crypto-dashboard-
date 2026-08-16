@@ -50,7 +50,7 @@ div[data-testid="stMetric"] {
 
 DEX = "https://api.dexscreener.com"
 CG = "https://api.coingecko.com/api/v3"
-HEADERS = {"accept":"application/json","user-agent":"market-intelligence-pro/6.0"}
+HEADERS = {"accept":"application/json","user-agent":"market-intelligence-pro/7.0"}
 
 MAJOR_CRYPTO = {
     "BTC":"BTC-USD","ETH":"ETH-USD","SOL":"SOL-USD","XRP":"XRP-USD",
@@ -635,6 +635,305 @@ def ticker_news_count(ticker):
     except Exception:
         return 0,[]
 
+
+# ---------------------------- PUBLIC INSIDER ACTIVITY ----------------------------
+
+@st.cache_data(ttl=300, show_spinner=False)
+def public_insider_data(ticker):
+    """
+    Reads publicly reported insider transactions exposed by yfinance.
+    These are public filings/aggregated filing data, not private information.
+    """
+    t = yf.Ticker(ticker)
+    tx = None
+    purchases = None
+    roster = None
+
+    try:
+        tx = t.insider_transactions
+    except Exception:
+        tx = None
+
+    try:
+        purchases = t.insider_purchases
+    except Exception:
+        purchases = None
+
+    try:
+        roster = t.insider_roster_holders
+    except Exception:
+        roster = None
+
+    return tx, purchases, roster
+
+def _find_col(df, names):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    lower = {str(c).lower(): c for c in df.columns}
+    for name in names:
+        if name.lower() in lower:
+            return lower[name.lower()]
+    for c in df.columns:
+        lc = str(c).lower()
+        for name in names:
+            if name.lower() in lc:
+                return c
+    return None
+
+def insider_engine(ticker):
+    tx, purchases, roster = public_insider_data(ticker)
+
+    result = {
+        "ticker": ticker,
+        "score": 50.0,
+        "signal": "MIXED / NO EDGE",
+        "confidence": "Low",
+        "open_buy_value": 0.0,
+        "open_sell_value": 0.0,
+        "buy_count": 0,
+        "sell_count": 0,
+        "cluster_buyers": 0,
+        "recent_rows": [],
+        "notes": [],
+        "roster": roster,
+        "raw": tx,
+    }
+
+    if tx is None or not isinstance(tx, pd.DataFrame) or tx.empty:
+        result["notes"].append("No insider transaction table was returned by the data provider.")
+        return result
+
+    df = tx.copy()
+
+    date_col = _find_col(df, ["Start Date", "Date", "Transaction Date"])
+    insider_col = _find_col(df, ["Insider", "Insider Name"])
+    position_col = _find_col(df, ["Position", "Title"])
+    trans_col = _find_col(df, ["Transaction", "Text"])
+    shares_col = _find_col(df, ["Shares", "Shares Traded"])
+    value_col = _find_col(df, ["Value", "Transaction Value"])
+    ownership_col = _find_col(df, ["Ownership"])
+
+    if date_col:
+        df["_date"] = pd.to_datetime(df[date_col], errors="coerce", utc=True)
+    else:
+        df["_date"] = pd.NaT
+
+    now = pd.Timestamp.now(tz="UTC")
+    recent = df[df["_date"].isna() | (df["_date"] >= now - pd.Timedelta(days=120))].copy()
+    if recent.empty:
+        recent = df.head(30).copy()
+
+    buy_people = set()
+
+    for _, row in recent.head(60).iterrows():
+        text = str(row.get(trans_col, "") if trans_col else "").lower()
+        insider = str(row.get(insider_col, "") if insider_col else "")
+        position = str(row.get(position_col, "") if position_col else "")
+        shares = fnum(row.get(shares_col, 0) if shares_col else 0)
+        value = abs(fnum(row.get(value_col, 0) if value_col else 0))
+        ownership = str(row.get(ownership_col, "") if ownership_col else "")
+
+        # Prioritize clearly voluntary open-market purchases/sales.
+        is_buy = any(k in text for k in [
+            "purchase", "buy", "bought", "open market purchase",
+            "acquisition", "p-purchase"
+        ])
+        is_sell = any(k in text for k in [
+            "sale", "sell", "sold", "open market sale", "s-sale"
+        ])
+
+        # Avoid treating option exercises, grants, gifts, awards as bullish purchases.
+        non_open = any(k in text for k in [
+            "option", "exercise", "grant", "award", "gift", "conversion",
+            "vesting", "tax", "withholding"
+        ])
+        if non_open and "open market" not in text:
+            is_buy = False
+            is_sell = False
+
+        if is_buy:
+            result["buy_count"] += 1
+            result["open_buy_value"] += value
+            if insider:
+                buy_people.add(insider)
+        elif is_sell:
+            result["sell_count"] += 1
+            result["open_sell_value"] += value
+
+        if is_buy or is_sell:
+            result["recent_rows"].append({
+                "Date": row.get(date_col, "") if date_col else "",
+                "Insider": insider or "Unknown",
+                "Role": position or "Unknown",
+                "Action": "BUY" if is_buy else "SELL",
+                "Shares": shares,
+                "Value": value,
+                "Ownership": ownership,
+                "Raw": str(row.get(trans_col, "") if trans_col else ""),
+            })
+
+    result["cluster_buyers"] = len(buy_people)
+
+    score = 50.0
+    buyv = result["open_buy_value"]
+    sellv = result["open_sell_value"]
+    bc = result["buy_count"]
+    sc = result["sell_count"]
+    cluster = result["cluster_buyers"]
+
+    if buyv >= 5_000_000:
+        score += 25
+        result["notes"].append("Large recent open-market insider buying.")
+    elif buyv >= 1_000_000:
+        score += 19
+        result["notes"].append("Meaningful recent insider buying.")
+    elif buyv >= 250_000:
+        score += 12
+    elif buyv > 0:
+        score += 6
+
+    if cluster >= 3:
+        score += 18
+        result["notes"].append("Cluster buying: several different insiders bought.")
+    elif cluster == 2:
+        score += 10
+        result["notes"].append("More than one insider bought.")
+    elif cluster == 1 and bc > 0:
+        score += 4
+
+    if bc >= 4:
+        score += 8
+    elif bc >= 2:
+        score += 4
+
+    if sellv > 0:
+        # Insider sales can happen for many non-bearish reasons, so penalize more gently.
+        if sellv >= max(5_000_000, buyv * 4):
+            score -= 18
+            result["notes"].append("Large insider selling relative to buying.")
+        elif sellv >= max(1_000_000, buyv * 2):
+            score -= 10
+        else:
+            score -= 3
+
+    if sc >= 5 and bc == 0:
+        score -= 8
+
+    score = round(clamp(score), 1)
+    result["score"] = score
+
+    if score >= 82 and bc > 0:
+        result["signal"] = "STRONG INSIDER BUYING"
+        result["confidence"] = "High"
+    elif score >= 68 and bc > 0:
+        result["signal"] = "INSIDER BUYING"
+        result["confidence"] = "Medium"
+    elif score <= 35 and sc > 0:
+        result["signal"] = "HEAVY INSIDER SELLING"
+        result["confidence"] = "Medium"
+    elif score <= 44 and sc > 0:
+        result["signal"] = "INSIDER SELLING"
+        result["confidence"] = "Low"
+    else:
+        result["signal"] = "MIXED / NO EDGE"
+        result["confidence"] = "Low"
+
+    if bc == 0 and sc == 0:
+        result["notes"].append(
+            "No clearly classified voluntary open-market buys/sells were found in the recent table."
+        )
+
+    return result
+
+def combined_stock_conviction(technical, insider):
+    if not technical:
+        return {"score": None, "label": "NO TECHNICAL DATA", "action": "WAIT"}
+
+    # Technicals remain dominant; public insider activity is confirmation, not a substitute.
+    combined = technical["score"] * 0.75 + insider["score"] * 0.25
+
+    if technical["direction"] == "DOWN" and insider["score"] >= 80:
+        label = "INSIDERS BULLISH, CHART NOT READY"
+        action = "WATCH — WAIT FOR TECHNICAL TURN"
+    elif combined >= 80 and technical["score"] >= 67:
+        label = "HIGH-CONVICTION BULLISH"
+        action = "BUY / HOLD WITH RISK CONTROL"
+    elif combined >= 68:
+        label = "BULLISH"
+        action = "HOLD / WATCH ENTRY"
+    elif combined <= 38:
+        label = "BEARISH"
+        action = "AVOID / REDUCE"
+    else:
+        label = "MIXED"
+        action = "WAIT"
+
+    return {"score": round(combined, 1), "label": label, "action": action}
+
+def render_insider_card(ticker, technical=None):
+    ins = insider_engine(ticker)
+    combo = combined_stock_conviction(technical, ins) if technical else None
+    icon = badge_for_score(ins["score"])
+
+    st.markdown(f"""
+    <div class="card">
+      <div class="asset">{icon} {ticker} — Public Insider Activity</div>
+      <div class="muted">Publicly reported corporate-insider transactions</div>
+      <div style="display:flex;justify-content:space-between;align-items:end;margin-top:9px">
+        <div>
+          <div class="verdict">{ins["signal"]}</div>
+          <div class="muted">Confidence: {ins["confidence"]}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="big">{ins["score"]}</div>
+          <div class="muted">insider score / 100</div>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Open-market buys", ins["buy_count"])
+    c2.metric("Buy value", compact(ins["open_buy_value"]))
+    c3.metric("Open-market sells", ins["sell_count"])
+    c4.metric("Sell value", compact(ins["open_sell_value"]))
+
+    st.metric("Different insiders buying", ins["cluster_buyers"])
+
+    if combo:
+        st.markdown("#### Insider + Chart Combined")
+        c1,c2,c3=st.columns(3)
+        c1.metric("Combined conviction", f'{combo["score"]}/100')
+        c2.metric("Conclusion", combo["label"])
+        c3.metric("Action", combo["action"])
+
+    if ins["notes"]:
+        st.write("**What the bot sees:** " + " • ".join(ins["notes"]))
+
+    rows=ins["recent_rows"][:20]
+    if rows:
+        display=pd.DataFrame(rows)
+        display["Value"]=display["Value"].map(lambda x: compact(x))
+        display["Shares"]=display["Shares"].map(lambda x: f"{x:,.0f}")
+        st.dataframe(
+            display[["Date","Insider","Role","Action","Shares","Value","Ownership"]],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No clearly classified recent open-market insider transactions were found.")
+
+    st.link_button(
+        "Open SEC EDGAR insider filings",
+        f"https://www.sec.gov/edgar/search/#/q={ticker}&filter_forms=4",
+        use_container_width=True
+    )
+    st.caption(
+        "Insider sales can happen for taxes, diversification, estate planning, or compensation reasons. "
+        "Open-market purchases and cluster buying generally carry more signal than routine sales."
+    )
+
+
 # ---------------------------- RENDERERS ----------------------------
 
 def render_dex_card(p,sources,mode="early"):
@@ -802,8 +1101,8 @@ def render_technical_card(label,ticker,rd,kind,news_count=0,headlines=None):
 
 st.markdown("""
 <div class="hero">
-  <div style="font-size:1.7rem;font-weight:900">🧠 Market Intelligence Pro v6</div>
-  <div class="muted">Early meme discovery • attention radar • crypto • stocks • entries • hold/exit logic • risk controls</div>
+  <div style="font-size:1.7rem;font-weight:900">🧠 Market Intelligence Pro v7</div>
+  <div class="muted">Early meme discovery • attention radar • crypto • stocks • public insider activity • entries • hold/exit logic • risk controls</div>
 </div>
 """,unsafe_allow_html=True)
 
@@ -817,6 +1116,7 @@ tabs=st.tabs([
     "🔥 Meme: Attention Radar",
     "₿ Crypto",
     "📈 Stocks",
+    "🕵️ Public Insider Bot",
     "⭐ Watchlist",
     "🛡️ Risk Calculator"
 ])
@@ -924,8 +1224,63 @@ with tabs[3]:
         nc,heads=ticker_news_count(s)
         render_technical_card(s,s,rd,"Stock",nc,heads)
 
-# ---------------- TAB 5: WATCHLIST ----------------
+
+# ---------------- TAB 5: PUBLIC INSIDER BOT ----------------
 with tabs[4]:
+    st.subheader("🕵️ Public Insider Bot")
+    st.caption(
+        "Tracks publicly reported corporate-insider activity. It gives more weight to voluntary "
+        "open-market purchases and cluster buying than to routine insider sales."
+    )
+    st.info(
+        "This is public filing analysis — not private or non-public insider information. "
+        "SEC Section 16 insiders generally include officers, directors, and >10% beneficial owners."
+    )
+
+    insider_input=st.text_input(
+        "Stock tickers for insider scan",
+        "NVDA,TSLA,AAPL,AMD,MSFT,AMZN,META,COIN,MSTR,PLTR",
+        key="insider_input"
+    )
+    insider_tickers=[x.strip().upper() for x in insider_input.split(",") if x.strip()][:15]
+
+    with st.spinner("Reading public insider activity and technical confirmation..."):
+        insider_market=yf_batch(insider_tickers)
+
+    ranked_insiders=[]
+    for symbol in insider_tickers:
+        tech=technical_engine(insider_market.get(symbol))
+        ins=insider_engine(symbol)
+        combo=combined_stock_conviction(tech,ins) if tech else {"score":ins["score"]}
+        ranked_insiders.append((combo.get("score") or ins["score"],symbol,tech,ins))
+
+    ranked_insiders.sort(reverse=True,key=lambda x:x[0])
+
+    st.markdown("### Strongest combined signals")
+    summary_rows=[]
+    for _,symbol,tech,ins in ranked_insiders:
+        combo=combined_stock_conviction(tech,ins) if tech else None
+        summary_rows.append({
+            "Ticker":symbol,
+            "Insider":ins["signal"],
+            "Insider Score":ins["score"],
+            "Technical":tech["direction"] if tech else "N/A",
+            "Technical Score":tech["score"] if tech else "N/A",
+            "Combined":combo["score"] if combo else "N/A",
+            "Conclusion":combo["label"] if combo else ins["signal"],
+        })
+    st.dataframe(pd.DataFrame(summary_rows),use_container_width=True,hide_index=True)
+
+    for _,symbol,tech,ins in ranked_insiders:
+        with st.expander(
+            f'{badge_for_score(ins["score"])} {symbol} — {ins["signal"]} — {ins["score"]}/100',
+            expanded=False
+        ):
+            render_insider_card(symbol,tech)
+
+
+# ---------------- TAB 5: WATCHLIST ----------------
+with tabs[5]:
     st.subheader("⭐ Mixed Watchlist")
     st.caption("Track stocks and common crypto together.")
     raw=st.text_input("Examples: NVDA, TSLA, BTC, ETH, SOL","NVDA,TSLA,BTC,ETH,SOL,DOGE",key="watch")
@@ -943,7 +1298,7 @@ with tabs[4]:
         render_technical_card(orig,t,rd,kind)
 
 # ---------------- TAB 6: RISK ----------------
-with tabs[5]:
+with tabs[6]:
     st.subheader("🛡️ Position Size & Risk Calculator")
     st.caption("The part that helps keep one bad trade from destroying the account.")
 
@@ -978,5 +1333,5 @@ st.divider()
 st.caption(
     "Data sources can be delayed, incomplete, rate-limited or wrong. Social-attention signals here include "
     "CoinGecko search trends, DEX Screener boosts/community/ads/social links, and on-chain trading acceleration; "
-    "this is not direct full-firehose access to every post on X, TikTok, Reddit, Telegram, Discord, YouTube, or Instagram."
+    "this is not direct full-firehose access to every post on X, TikTok, Reddit, Telegram, Discord, YouTube, or Instagram. The Insider Bot uses publicly reported/aggregated filing data only and is not access to non-public information."
 )
