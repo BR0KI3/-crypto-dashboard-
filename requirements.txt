@@ -1,0 +1,4 @@
+streamlit>=1.37
+alpaca-py>=0.42
+pandas>=2.2
+numpy>=1.26
