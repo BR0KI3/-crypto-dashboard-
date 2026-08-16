@@ -50,7 +50,7 @@ div[data-testid="stMetric"] {
 
 DEX = "https://api.dexscreener.com"
 CG = "https://api.coingecko.com/api/v3"
-HEADERS = {"accept":"application/json","user-agent":"market-intelligence-pro/7.0"}
+HEADERS = {"accept":"application/json","user-agent":"market-intelligence-pro/8.0"}
 
 MAJOR_CRYPTO = {
     "BTC":"BTC-USD","ETH":"ETH-USD","SOL":"SOL-USD","XRP":"XRP-USD",
@@ -934,6 +934,256 @@ def render_insider_card(ticker, technical=None):
     )
 
 
+
+# ---------------------------- UNIVERSAL INSIDER / SMART-MONEY LAYER ----------------------------
+
+def classify_stock_insider_bot(insider_result):
+    return {
+        "bot_type": "Public Corporate Insider Bot",
+        "source_type": "Public insider filings / aggregated filing data",
+        "score": insider_result.get("score", 50),
+        "signal": insider_result.get("signal", "MIXED / NO EDGE"),
+        "confidence": insider_result.get("confidence", "Low"),
+        "explanation": (
+            "Tracks publicly reported corporate-insider transactions. "
+            "Open-market purchases and cluster buying carry more weight than routine sales."
+        ),
+        "is_true_insider": True,
+    }
+
+def crypto_smart_money_proxy(rd):
+    if not rd:
+        return {
+            "bot_type":"Crypto Smart-Money Bot",
+            "source_type":"Market-flow proxy",
+            "score":50.0,
+            "signal":"NO DATA",
+            "confidence":"Low",
+            "explanation":"Uses market-flow and technical behavior as a proxy. This is not private insider information.",
+            "is_true_insider":False,
+        }
+
+    score=50.0
+    reasons=[]
+    risks=[]
+
+    # Relative volume / momentum / breakout alignment as smart-money-style proxy.
+    if rd["rel_vol"] >= 1.8:
+        score += 18
+        reasons.append("strong relative volume")
+    elif rd["rel_vol"] >= 1.2:
+        score += 10
+        reasons.append("above-average volume")
+    elif rd["rel_vol"] < .6:
+        score -= 8
+        risks.append("weak participation")
+
+    if rd["r5"] > 0 and rd["r20"] > 0:
+        score += 14
+        reasons.append("multi-timeframe momentum aligned")
+    elif rd["r5"] < 0 and rd["r20"] < 0:
+        score -= 14
+        risks.append("momentum aligned down")
+
+    if 52 <= rd["rsi"] <= 70:
+        score += 8
+    elif rd["rsi"] > 78:
+        score -= 10
+        risks.append("overheated")
+
+    if 0 <= rd["breakout"] <= 4:
+        score += 10
+        reasons.append("fresh breakout behavior")
+    elif rd["breakout"] > 8:
+        score -= 8
+        risks.append("late breakout / chase risk")
+
+    score=round(clamp(score),1)
+    if score>=80:
+        signal="STRONG SMART-MONEY PROXY"
+        confidence="High"
+    elif score>=67:
+        signal="POSITIVE FLOW PROXY"
+        confidence="Medium"
+    elif score<=35:
+        signal="NEGATIVE FLOW PROXY"
+        confidence="Medium"
+    else:
+        signal="MIXED FLOW"
+        confidence="Low"
+
+    return {
+        "bot_type":"Crypto Smart-Money Bot",
+        "source_type":"Market-flow proxy",
+        "score":score,
+        "signal":signal,
+        "confidence":confidence,
+        "explanation":"Uses volume, momentum, breakout behavior and participation as a public smart-money proxy. It is not private insider information.",
+        "is_true_insider":False,
+        "reasons":reasons[:4],
+        "risks":risks[:4],
+    }
+
+def meme_insider_risk_proxy(m, sources=None):
+    score=50.0
+    reasons=[]
+    risks=[]
+
+    # Early buyer dominance.
+    if m["activity5"] >= 20 and m["ratio5"] >= 1.6:
+        score += 16
+        reasons.append("early buyer dominance")
+    elif m["s5"] > m["b5"]*1.5:
+        score -= 16
+        risks.append("early seller dominance")
+
+    # Liquidity depth.
+    if m["liq"] >= 150_000:
+        score += 14
+        reasons.append("healthy liquidity depth")
+    elif m["liq"] >= 40_000:
+        score += 7
+    elif m["liq"] < 10_000:
+        score -= 25
+        risks.append("thin liquidity / exit risk")
+
+    # Volume acceleration.
+    avg5 = m["vol1"]/12 if m["vol1"] > 0 else 0
+    if avg5 > 0 and m["vol5"] >= avg5*2:
+        score += 12
+        reasons.append("5m volume accelerating")
+
+    # Anti-chase / insider-dump style warning.
+    if m["pc1"] > 100:
+        score -= 22
+        risks.append("already exploded / dump risk")
+    elif m["pc1"] > 60:
+        score -= 12
+        risks.append("late-entry risk")
+
+    # Very new + low liquidity is especially dangerous.
+    if m["age"]["hours"] < .5 and m["liq"] < 30_000:
+        score -= 12
+        risks.append("extremely new with weak liquidity")
+
+    # Marketing signals don't count as bullish by themselves.
+    meta=m["meta"]
+    if meta.get("boost_total",0) > 0:
+        risks.append("paid boost detected")
+    if meta.get("ad"):
+        risks.append("paid ad detected")
+
+    score=round(clamp(score),1)
+
+    if score>=80:
+        signal="HEALTHY EARLY FLOW"
+        confidence="High"
+    elif score>=67:
+        signal="PROMISING EARLY FLOW"
+        confidence="Medium"
+    elif score<=35:
+        signal="HIGH INSIDER/RUG RISK PROXY"
+        confidence="High"
+    else:
+        signal="MIXED EARLY FLOW"
+        confidence="Low"
+
+    return {
+        "bot_type":"Meme Insider-Risk Bot",
+        "source_type":"Public on-chain / liquidity proxy",
+        "score":score,
+        "signal":signal,
+        "confidence":confidence,
+        "explanation":(
+            "This is a risk proxy, not access to private developer or insider wallets. "
+            "It looks for early buyer/seller imbalance, liquidity depth, volume acceleration, "
+            "extreme pumps and paid-promotion risk."
+        ),
+        "is_true_insider":False,
+        "reasons":reasons[:4],
+        "risks":risks[:5],
+    }
+
+def meme_attention_whale_proxy(m):
+    score=50.0
+    reasons=[]
+    risks=[]
+    meta=m["meta"]
+
+    if m["activity5"] >= 35:
+        score += 15
+        reasons.append("high 5m transaction activity")
+    elif m["activity5"] >= 15:
+        score += 8
+
+    if m["ratio5"] >= 1.5 and m["activity5"] >= 10:
+        score += 12
+        reasons.append("buyers dominating recent flow")
+    elif m["s5"] > m["b5"]*1.5:
+        score -= 12
+        risks.append("seller-heavy flow")
+
+    avg5 = m["vol1"]/12 if m["vol1"] > 0 else 0
+    if avg5 > 0 and m["vol5"] >= avg5*1.8:
+        score += 12
+        reasons.append("attention accelerating")
+
+    if meta.get("boost_total",0) > 0:
+        risks.append("paid DEX boost present")
+    if meta.get("ad"):
+        risks.append("paid ad present")
+    if meta.get("community"):
+        reasons.append("community takeover signal")
+
+    if m["pc1"] > 120:
+        score -= 18
+        risks.append("attention arrived after a huge pump")
+
+    score=round(clamp(score),1)
+    if score>=80:
+        signal="STRONG ORGANIC-STYLE ATTENTION"
+        confidence="High"
+    elif score>=67:
+        signal="ATTENTION BUILDING"
+        confidence="Medium"
+    elif score<=35:
+        signal="WEAK / PROMOTION-HEAVY"
+        confidence="Medium"
+    else:
+        signal="MIXED ATTENTION"
+        confidence="Low"
+
+    return {
+        "bot_type":"Meme Attention / Whale Proxy",
+        "source_type":"Trading acceleration + public promotion signals",
+        "score":score,
+        "signal":signal,
+        "confidence":confidence,
+        "explanation":(
+            "Separates trading acceleration from paid promotion. "
+            "This is not private insider information or direct access to every social platform."
+        ),
+        "is_true_insider":False,
+        "reasons":reasons[:4],
+        "risks":risks[:5],
+    }
+
+def render_insider_proxy_panel(bot):
+    st.markdown("### 🧭 Insider / Smart-Money Signal")
+    st.caption(f'**Bot type:** {bot["bot_type"]} • **Signal source:** {bot["source_type"]}')
+    c1,c2,c3=st.columns(3)
+    c1.metric("Bot score",f'{bot["score"]}/100')
+    c2.metric("Signal",bot["signal"])
+    c3.metric("Confidence",bot["confidence"])
+    st.write(bot["explanation"])
+    if bot.get("reasons"):
+        st.write("**Positive evidence:** " + " • ".join(bot["reasons"]))
+    if bot.get("risks"):
+        st.write("**Risk flags:** " + " • ".join(bot["risks"]))
+    if not bot.get("is_true_insider",False):
+        st.info("This section is a public-data proxy. It is not access to material non-public information.")
+
+
 # ---------------------------- RENDERERS ----------------------------
 
 def render_dex_card(p,sources,mode="early"):
@@ -991,6 +1241,8 @@ def render_dex_card(p,sources,mode="early"):
     """,unsafe_allow_html=True)
 
     if mode=="early":
+        insider_proxy = meme_insider_risk_proxy(m, sources)
+        render_insider_proxy_panel(insider_proxy)
         c1,c2,c3,c4=st.columns(4)
         c1.metric("Liquidity",compact(m["liq"]))
         c2.metric("1h volume",compact(m["vol1"]))
@@ -1020,6 +1272,8 @@ def render_dex_card(p,sources,mode="early"):
         if risk:
             st.write("**Risks:** " + " • ".join(risk))
     else:
+        attention_proxy = meme_attention_whale_proxy(m)
+        render_insider_proxy_panel(attention_proxy)
         c1,c2,c3,c4=st.columns(4)
         c1.metric("Attention score",f"{attn}/100")
         c2.metric("5m volume",compact(m["vol5"]))
@@ -1090,7 +1344,19 @@ def render_technical_card(label,ticker,rd,kind,news_count=0,headlines=None):
     if rd["risks"]:
         st.write("**Risk flags:** " + " • ".join(rd["risks"]))
 
+    if kind=="Crypto":
+        smart = crypto_smart_money_proxy(rd)
+        render_insider_proxy_panel(smart)
+
     if kind=="Stock":
+        st.markdown("#### Public Insider / Smart-Money Signal")
+        try:
+            ins = insider_engine(ticker)
+            bot = classify_stock_insider_bot(ins)
+            render_insider_proxy_panel(bot)
+        except Exception:
+            st.info("Public insider data could not be loaded for this stock.")
+
         st.markdown("#### News / attention")
         st.write(f"Recent news items detected: **{news_count}**")
         if headlines:
@@ -1101,8 +1367,8 @@ def render_technical_card(label,ticker,rd,kind,news_count=0,headlines=None):
 
 st.markdown("""
 <div class="hero">
-  <div style="font-size:1.7rem;font-weight:900">🧠 Market Intelligence Pro v7</div>
-  <div class="muted">Early meme discovery • attention radar • crypto • stocks • public insider activity • entries • hold/exit logic • risk controls</div>
+  <div style="font-size:1.7rem;font-weight:900">🧠 Market Intelligence Pro v8</div>
+  <div class="muted">Early meme discovery • attention radar • crypto • stocks • insider/smart-money layer in every section • entries • hold/exit logic • risk controls</div>
 </div>
 """,unsafe_allow_html=True)
 
